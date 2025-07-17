@@ -1,60 +1,77 @@
 import os
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
+import fitz  # PyMuPDF
+from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import ollama
 
-# 1. Load embedding model
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+# Load and read supported file types
+def read_file(filepath):
+    ext = os.path.splitext(filepath)[1].lower()
 
-# 2. Load and split document into chunks
-def load_document(filepath, chunk_size=100):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        text = f.read()
-    # Simple chunking by sentence (or every N words)
-    words = text.split()
-    chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-    return chunks
+    if ext == '.txt':
+        encodings = ['utf-8', 'latin1', 'cp1252']
+        for enc in encodings:
+            try:
+                with open(filepath, 'r', encoding=enc) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+        raise UnicodeDecodeError("Could not decode the file with known encodings.")
+    
+    elif ext == '.docx':
+        doc = Document(filepath)
+        return '\n'.join([para.text for para in doc.paragraphs])
+    
+    elif ext == '.pdf':
+        text = ""
+        with fitz.open(filepath) as doc:
+            for page in doc:
+                text += page.get_text()
+        return text
 
-# 3. Create FAISS index
-def create_faiss_index(docs):
-    embeddings = embedder.encode(docs)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(np.array(embeddings))
-    return index, embeddings
+    else:
+        raise ValueError("Unsupported file type. Use .txt, .docx, or .pdf")
 
-# 4. Retrieve top-k relevant chunks
-def retrieve_context(query, index, docs, k=3):
-    query_vec = embedder.encode([query])
-    D, I = index.search(np.array(query_vec), k)
-    return [docs[i] for i in I[0]]
+# Split text into chunks
+def split_text(text, chunk_size=300):
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-# 5. RAG using Ollama
-def rag_generate(query, context, model='llama3'):
-    prompt = f"""You are a helpful assistant.
+# Retrieve top chunks using semantic search
+def semantic_search(chunks, query, top_k=3):
+    vectorizer = TfidfVectorizer().fit(chunks + [query])
+    chunk_vecs = vectorizer.transform(chunks)
+    query_vec = vectorizer.transform([query])
+    similarities = cosine_similarity(query_vec, chunk_vecs).flatten()
+    top_indices = similarities.argsort()[::-1][:top_k]
+    return [chunks[i] for i in top_indices]
 
-Use the following context to answer the question:
-{chr(10).join(context)}
+# Query the llama3 model with retrieved context
+def query_llm(context, question):
+    prompt = f"""You are an insurance domain assistant. Based on the following policy records, answer the question in a professional tone.
 
-Question: {query}
+Context:
+{context}
+
+Question:
+{question}
+
 Answer:"""
-    response = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
+
+    response = ollama.chat(model='llama3', messages=[{"role": "user", "content": prompt}])
     return response['message']['content']
 
-# 6. Main function to run RAG with file input
-def run_rag_with_file(file_path, query):
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-    
-    documents = load_document(file_path)
-    index, _ = create_faiss_index(documents)
-    context = retrieve_context(query, index, documents)
-    answer = rag_generate(query, context)
-    return answer
+# MAIN PROGRAM
+if __name__ == '__main__':
+    file_path = input("Enter file path (.txt, .pdf, .docx): ").strip()
+    question = input("Ask your insurance-related question: ").strip()
 
-# 7. Example usage
-if __name__ == "__main__":
-    filepath = "insurance.json"  # Replace with your .txt file path
-    question = input("Enter your question: ")
-    result = run_rag_with_file(filepath, question)
-    print("\nAnswer:\n", result)
+    print("\nReading and processing file...")
+    full_text = read_file(file_path)
+    chunks = split_text(full_text, chunk_size=500)
+    top_chunks = semantic_search(chunks, question)
+    context = "\n\n".join(top_chunks)
+
+    print("\nGenerating answer using Llama3...")
+    answer = query_llm(context, question)
+    print("\n🧠 Answer:\n", answer)
